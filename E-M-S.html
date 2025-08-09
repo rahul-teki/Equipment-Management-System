@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="en" class="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Equipment Servicing & Inventory Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom font family */
+        body {
+            font-family: 'Helvetica', 'Arial', sans-serif;
+        }
+        /* Custom scrollbar for better aesthetics */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 10px;
+        }
+        .dark ::-webkit-scrollbar-track {
+            background: #2d3748;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #888;
+            border-radius: 10px;
+        }
+        .dark ::-webkit-scrollbar-thumb {
+            background: #4a5568;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+        .dark ::-webkit-scrollbar-thumb:hover {
+            background: #718096;
+        }
+        /* New styles for disabled buttons to provide visual feedback */
+        .disabled-btn {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+    </style>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables for Firebase configuration, provided by the Canvas environment.
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // State variables
+        let userId = null;
+        let equipment = [];
+        let servicingLog = [];
+        let db = null;
+        let auth = null;
+        let isFirestoreSetup = false; // Flag to prevent multiple listeners
+
+        // UI elements
+        const dashboardView = document.getElementById('dashboard-view');
+        const inventoryView = document.getElementById('inventory-view');
+        const servicingView = document.getElementById('servicing-view');
+        const equipmentModal = document.getElementById('equipment-modal');
+        const servicingModal = document.getElementById('servicing-modal');
+        const notificationBox = document.getElementById('notification-box');
+        const reportTextarea = document.getElementById('servicing-report-draft');
+        const themeToggleBtn = document.getElementById('theme-toggle');
+        const dashboardBtn = document.getElementById('dashboard-btn');
+        const inventoryBtn = document.getElementById('inventory-btn');
+        const servicingBtn = document.getElementById('servicing-btn');
+        const userIdEl = document.getElementById('user-id-value');
+        const userIdDisplay = document.getElementById('user-id-display');
+        const loadingIndicator = document.getElementById('app-loading-indicator');
+
+        // --- Helper Function for Date Formatting ---
+        /**
+         * Formats a date string from YYYY-MM-DD to DD/MM/YYYY.
+         * @param {string} dateString The date string in YYYY-MM-DD format.
+         * @returns {string} The formatted date string or 'N/A' if invalid.
+         */
+        function formatDate(dateString) {
+            if (!dateString) return 'N/A';
+            const [year, month, day] = dateString.split('-');
+            if (!year || !month || !day) return 'N/A';
+            return `${day}/${month}/${year}`;
+        }
+
+        // --- Theme Management ---
+        function initializeTheme() {
+            const currentTheme = localStorage.getItem('theme') || 'light';
+            document.documentElement.classList.remove('light', 'dark');
+            document.documentElement.classList.add(currentTheme);
+            if (currentTheme === 'dark') {
+                 themeToggleBtn.innerHTML = '🌞';
+            } else {
+                 themeToggleBtn.innerHTML = '🌙';
+            }
+        }
+
+        function toggleTheme() {
+            const isDark = document.documentElement.classList.toggle('dark');
+            if (isDark) {
+                document.documentElement.classList.remove('light');
+                localStorage.setItem('theme', 'dark');
+                themeToggleBtn.innerHTML = '🌞';
+            } else {
+                document.documentElement.classList.add('light');
+                localStorage.setItem('theme', 'light');
+                themeToggleBtn.innerHTML = '🌙';
+            }
+        }
+        
+        // --- Authentication and Firestore setup ---
+        async function initializeAppAndAuth() {
+            console.log("Initializing Firebase app...");
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            // Hide main content and show loading spinner
+            document.getElementById('main-content').classList.add('hidden');
+            loadingIndicator.classList.remove('hidden');
+
+            // Set up a listener for authentication state changes
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    console.log("User authenticated successfully:", user.uid);
+                    userId = user.uid;
+                    userIdEl.textContent = userId;
+                    userIdDisplay.classList.remove('text-red-500', 'font-bold');
+                    updateNotification('success', `Signed in as user: ${userId}`);
+
+                    // Show content and hide loading spinner after auth state is determined
+                    loadingIndicator.classList.add('hidden');
+                    document.getElementById('main-content').classList.remove('hidden');
+                    
+                    // Now that the user ID is set, enable UI and set up Firestore listeners
+                    enableUI();
+                    setupFirestoreListeners();
+                } else {
+                    console.warn('Authentication failed. No user object received.');
+                    // This case handles a complete failure to sign in, which makes the app unusable.
+                    userId = null;
+                    userIdEl.textContent = 'Authentication Failed';
+                    userIdDisplay.classList.add('text-red-500', 'font-bold');
+                    updateNotification('error', 'Authentication failed. Please try again.');
+                    
+                    // Hide content and show an error message
+                    loadingIndicator.classList.add('hidden');
+                    document.getElementById('main-content').classList.remove('hidden');
+                    disableUI();
+                }
+            });
+
+            // Try to sign in with the provided token or anonymously
+            try {
+                if (initialAuthToken) {
+                    console.log("Attempting to sign in with custom token...");
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    console.log("No custom token provided. Signing in anonymously...");
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Authentication Error:", error);
+                // The onAuthStateChanged listener will handle the UI update after this fails
+            }
+        }
+        
+        function disableUI() {
+             const navButtons = [dashboardBtn, inventoryBtn, servicingBtn];
+             navButtons.forEach(btn => {
+                 if (btn) {
+                     btn.setAttribute('disabled', true);
+                     btn.classList.add('disabled-btn');
+                 }
+             });
+        }
+
+        // Enable UI after successful authentication or as guest
+        function enableUI() {
+            // Remove disabled state from buttons and update styles
+            const navButtons = [dashboardBtn, inventoryBtn, servicingBtn];
+            navButtons.forEach(btn => {
+                if (btn) {
+                    btn.removeAttribute('disabled');
+                    btn.classList.remove('disabled-btn');
+                }
+            });
+
+            // Set the initial view to dashboard after authentication
+            showView('dashboard');
+        }
+
+        // Set up real-time listeners for Firestore collections
+        function setupFirestoreListeners() {
+            if (isFirestoreSetup || !userId || !db) {
+                console.warn("Firestore listeners already set up or missing prerequisites. Aborting.");
+                return;
+            }
+            isFirestoreSetup = true; // Set the flag to true
+            
+            const equipmentCollectionPath = `artifacts/${appId}/users/${userId}/equipment`;
+            const servicingLogCollectionPath = `artifacts/${appId}/users/${userId}/servicingLog`;
+            
+            console.log("Setting up Firestore listeners for user:", userId);
+            console.log("Equipment path:", equipmentCollectionPath);
+            console.log("Servicing log path:", servicingLogCollectionPath);
+            
+            // Equipment listener
+            onSnapshot(collection(db, equipmentCollectionPath), (snapshot) => {
+                equipment = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderDashboard();
+                renderInventory();
+            }, (error) => {
+                console.error("Error fetching equipment from path:", equipmentCollectionPath, error);
+                updateNotification('error', 'Failed to load equipment data. Check console for details.');
+            });
+
+            // Servicing log listener
+            onSnapshot(collection(db, servicingLogCollectionPath), (snapshot) => {
+                servicingLog = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderDashboard();
+                renderServicingLog();
+            }, (error) => {
+                console.error("Error fetching servicing log from path:", servicingLogCollectionPath, error);
+                updateNotification('error', 'Failed to load servicing log. Check console for details.');
+            });
+        }
+
+        // --- View Management ---
+        function showView(viewName) {
+            dashboardView.classList.add('hidden');
+            inventoryView.classList.add('hidden');
+            servicingView.classList.add('hidden');
+            document.getElementById(`${viewName}-view`).classList.remove('hidden');
+
+            document.querySelectorAll('nav button').forEach(btn => {
+                btn.classList.remove('bg-blue-700', 'text-white');
+                btn.classList.add('bg-gray-200', 'dark:bg-gray-700', 'text-gray-800', 'dark:text-gray-200');
+            });
+            const activeBtn = document.getElementById(`${viewName}-btn`);
+            if (activeBtn) {
+                activeBtn.classList.remove('bg-gray-200', 'dark:bg-gray-700', 'text-gray-800', 'dark:text-gray-200');
+                activeBtn.classList.add('bg-blue-700', 'text-white');
+            }
+        }
+
+        // --- Rendering Functions ---
+        function renderDashboard() {
+            const loadingIndicator = document.getElementById('dashboard-loading');
+            if (loadingIndicator) loadingIndicator.classList.remove('hidden');
+
+            const cameras = equipment.filter(e => e.equipmentType === 'Camera');
+            const totalCameras = cameras.length;
+            
+            const camerasInServicing = cameras.filter(c => {
+                const isServicing = c.currentStatus === 'In Servicing';
+                const serviceEndDatePassed = c.serviceEndDate && new Date(c.serviceEndDate) < new Date();
+                return isServicing && !serviceEndDatePassed;
+            }).length;
+
+            const availableCameras = cameras.filter(c => c.currentStatus === 'Available').length;
+            const inUseCameras = cameras.filter(c => c.currentStatus === 'In Use').length;
+
+            const currentYear = new Date().getFullYear();
+            const totalServicingCostYTD = servicingLog
+                .filter(s => s.serviceStartDate && new Date(s.serviceStartDate) >= new Date(currentYear, 0, 1))
+                .reduce((sum, s) => sum + (s.servicingCost || 0), 0);
+
+            const totalCamerasEl = document.getElementById('total-cameras');
+            if (totalCamerasEl) totalCamerasEl.textContent = totalCameras;
+            
+            const camerasInServicingEl = document.getElementById('cameras-in-servicing');
+            if (camerasInServicingEl) camerasInServicingEl.textContent = camerasInServicing;
+            
+            const availableCamerasEl = document.getElementById('available-cameras');
+            if (availableCamerasEl) availableCamerasEl.textContent = availableCameras;
+            
+            const inUseCamerasEl = document.getElementById('in-use-cameras');
+            if (inUseCamerasEl) inUseCamerasEl.textContent = inUseCameras;
+            
+            const totalServicingCostYtdEl = document.getElementById('total-servicing-cost-ytd');
+            if (totalServicingCostYtdEl) totalServicingCostYtdEl.textContent = `BHD ${totalServicingCostYTD.toFixed(3)}`;
+
+            // Render cameras in servicing table
+            const servicingTableBody = document.getElementById('cameras-in-servicing-table-body');
+            if (servicingTableBody) {
+                servicingTableBody.innerHTML = '';
+                const servicingCameras = cameras.filter(c => {
+                    const isServicing = c.currentStatus === 'In Servicing';
+                    const serviceEndDatePassed = c.serviceEndDate && new Date(c.serviceEndDate) < new Date();
+                    return isServicing && !serviceEndDatePassed;
+                });
+                servicingCameras.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.className = 'border-b dark:border-gray-700';
+                    row.innerHTML = `
+                        <td class="px-6 py-4">${item.equipmentID}</td>
+                        <td class="px-6 py-4">${item.equipmentModel}</td>
+                        <td class="px-6 py-4">${item.servicingPerson || 'N/A'}</td>
+                        <td class="px-6 py-4">${formatDate(item.lastServiceDate)}</td>
+                    `;
+                    servicingTableBody.appendChild(row);
+                });
+            }
+
+            // Render upcoming servicing table
+            const upcomingTableBody = document.getElementById('upcoming-servicing-table-body');
+            if (upcomingTableBody) {
+                upcomingTableBody.innerHTML = '';
+                const upcomingCameras = cameras
+                    .filter(c => c.nextServiceDueDate)
+                    .sort((a, b) => new Date(a.nextServiceDueDate) - new Date(b.nextServiceDueDate));
+
+                upcomingCameras.forEach(item => {
+                    const isOverdue = new Date(item.nextServiceDueDate) < new Date();
+                    const row = document.createElement('tr');
+                    row.className = `border-b dark:border-gray-700 ${isOverdue ? 'bg-red-100 dark:bg-red-900' : ''}`;
+                    row.innerHTML = `
+                        <td class="px-6 py-4">${item.equipmentID}</td>
+                        <td class="px-6 py-4">${item.equipmentModel}</td>
+                        <td class="px-6 py-4">${formatDate(item.lastServiceDate)}</td>
+                        <td class="px-6 py-4">${formatDate(item.nextServiceDueDate)}</td>
+                    `;
+                    upcomingTableBody.appendChild(row);
+                });
+            }
+            if (loadingIndicator) loadingIndicator.classList.add('hidden');
+        }
+
+        function renderInventory() {
+            const tableBody = document.getElementById('inventory-table-body');
+            if (tableBody) {
+                tableBody.innerHTML = '';
+                equipment.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.className = 'border-b dark:border-gray-700';
+                    const isOverdue = item.nextServiceDueDate && new Date(item.nextServiceDueDate) < new Date();
+                    row.innerHTML = `
+                        <td class="px-6 py-4">${item.equipmentID}</td>
+                        <td class="px-6 py-4">${item.equipmentType}</td>
+                        <td class="px-6 py-4">${item.serialNumber}</td>
+                        <td class="px-6 py-4">${item.currentStatus}</td>
+                        <td class="px-6 py-4 ${isOverdue ? 'text-red-500 font-bold' : ''}">${formatDate(item.nextServiceDueDate)}</td>
+                        <td class="px-6 py-4">
+                            <button class="bg-yellow-500 text-white px-3 py-1 rounded-md hover:bg-yellow-600 edit-equipment-btn" data-id="${item.id}">Edit</button>
+                            <button class="bg-red-500 text-white px-3 py-1 rounded-md hover:bg-red-600 delete-equipment-btn" data-id="${item.id}">Delete</button>
+                        </td>
+                    `;
+                    tableBody.appendChild(row);
+                });
+                document.querySelectorAll('.edit-equipment-btn').forEach(btn => btn.addEventListener('click', (e) => openEquipmentModal(e.target.dataset.id)));
+                document.querySelectorAll('.delete-equipment-btn').forEach(btn => btn.addEventListener('click', (e) => deleteEquipment(e.target.dataset.id)));
+            }
+        }
+
+        function renderServicingLog() {
+            const tableBody = document.getElementById('servicing-table-body');
+            if (tableBody) {
+                tableBody.innerHTML = '';
+                servicingLog.forEach(record => {
+                    const row = document.createElement('tr');
+                    row.className = 'border-b dark:border-gray-700';
+                    row.innerHTML = `
+                        <td class="px-6 py-4">${record.equipmentID}</td>
+                        <td class="px-6 py-4">${formatDate(record.serviceStartDate)}</td>
+                        <td class="px-6 py-4">${formatDate(record.serviceEndDate)}</td>
+                        <td class="px-6 py-4">${record.servicingPerson}</td>
+                        <td class="px-6 py-4">${record.serviceType}</td>
+                        <td class="px-6 py-4">BHD ${record.servicingCost ? record.servicingCost.toFixed(3) : '0.000'}</td>
+                    `;
+                    tableBody.appendChild(row);
+                });
+            }
+        }
+
+        // --- Modals and Notifications ---
+        function openEquipmentModal(docId = null) {
+            const form = document.getElementById('equipment-form');
+            if (!form) return;
+            form.reset();
+            
+            form.dataset.docId = docId || '';
+
+            const statusSelect = form.querySelector('#equipment-status');
+            const equipmentIDInput = form.querySelector('#equipment-id');
+            const equipmentModalEl = document.getElementById('equipment-modal');
+            const equipmentTypeSelect = form.querySelector('#equipment-type');
+
+            if (!equipmentModalEl) return;
+
+            // Clear and populate equipment type options
+            equipmentTypeSelect.innerHTML = '<option value="" disabled selected>Select a Type</option>';
+            ['Camera', 'Lens', 'Tripod', 'Microphone', 'Light', 'Other'].forEach(type => {
+                const option = document.createElement('option');
+                option.value = type;
+                option.textContent = type;
+                equipmentTypeSelect.appendChild(option);
+            });
+
+            // Clear and populate equipment status options
+            statusSelect.innerHTML = '';
+            ['In Use', 'In Servicing', 'Available', 'Retired'].forEach(status => {
+                const option = document.createElement('option');
+                option.value = status;
+                option.textContent = status;
+                statusSelect.appendChild(option);
+            });
+
+            if (docId) {
+                const item = equipment.find(e => e.id === docId);
+                if (item) {
+                    equipmentIDInput.value = item.equipmentID;
+                    equipmentIDInput.disabled = true; // Prevent changing ID
+                    form.querySelector('#equipment-type').value = item.equipmentType;
+                    form.querySelector('#equipment-model').value = item.equipmentModel;
+                    form.querySelector('#equipment-serial').value = item.serialNumber;
+                    form.querySelector('#equipment-purchase-date').value = item.purchaseDate;
+                    form.querySelector('#equipment-status').value = item.currentStatus;
+                    form.querySelector('#equipment-notes').value = item.servicingNotes;
+                }
+            } else {
+                 equipmentIDInput.disabled = false;
+            }
+            equipmentModalEl.classList.remove('hidden');
+        }
+
+        function openServicingModal() {
+            const form = document.getElementById('servicing-form');
+            if (!form) return;
+            form.reset();
+            const reportTextareaEl = document.getElementById('servicing-report-draft');
+            if (reportTextareaEl) {
+                reportTextareaEl.value = '';
+                reportTextareaEl.classList.add('hidden');
+            }
+            const equipmentIDSelect = form.querySelector('#servicing-equipment-id');
+            const serviceTypeSelect = form.querySelector('#service-type');
+            const servicingModalEl = document.getElementById('servicing-modal');
+            if (!servicingModalEl) return;
+
+            // Clear and populate dropdowns with all equipment
+            equipmentIDSelect.innerHTML = '<option value="" disabled selected>Select Equipment ID</option>';
+            equipment.forEach(item => {
+                const option = document.createElement('option');
+                option.value = item.equipmentID;
+                option.textContent = `${item.equipmentID} - ${item.equipmentModel}`; // Display ID and model
+                equipmentIDSelect.appendChild(option);
+            });
+
+            serviceTypeSelect.innerHTML = '<option value="" disabled selected>Select a Service Type</option>';
+            ['Routine Maintenance', 'Repair', 'Cleaning', 'Calibration'].forEach(type => {
+                const option = document.createElement('option');
+                option.value = type;
+                option.textContent = type;
+                serviceTypeSelect.appendChild(option);
+            });
+
+            servicingModalEl.classList.remove('hidden');
+        }
+
+        function closeModal(modalElement) {
+            if (modalElement) modalElement.classList.add('hidden');
+        }
+
+        function updateNotification(type, message) {
+            if (!notificationBox) return;
+            notificationBox.textContent = message;
+            notificationBox.classList.remove('hidden', 'bg-green-100', 'text-green-800', 'bg-red-100', 'text-red-800', 'dark:bg-green-900', 'dark:text-green-100', 'dark:bg-red-900', 'dark:text-red-100');
+            if (type === 'success') {
+                notificationBox.classList.add('bg-green-100', 'text-green-800', 'dark:bg-green-900', 'dark:text-green-100');
+            } else {
+                notificationBox.classList.add('bg-red-100', 'text-red-800', 'dark:bg-red-900', 'dark:text-red-100');
+            }
+            setTimeout(() => notificationBox.classList.add('hidden'), 5000);
+        }
+
+        // --- Firestore Operations ---
+        async function addOrUpdateEquipment(event) {
+            event.preventDefault();
+            const form = event.target;
+            const docId = form.dataset.docId;
+            const equipmentCollectionPath = `artifacts/${appId}/users/${userId}/equipment`;
+            
+            const equipmentID = form['equipment-id'].value;
+            const equipmentType = form['equipment-type'].value;
+            const equipmentModel = form['equipment-model'].value;
+            const serialNumber = form['equipment-serial'].value;
+            const purchaseDate = form['equipment-purchase-date'].value;
+            const currentStatus = form['equipment-status'].value;
+            const servicingNotes = form['equipment-notes'].value;
+
+            const equipmentData = {
+                equipmentID,
+                equipmentType,
+                equipmentModel,
+                serialNumber,
+                purchaseDate,
+                currentStatus,
+                servicingNotes,
+            };
+
+            try {
+                if (docId && docId.length > 0) {
+                    await updateDoc(doc(db, equipmentCollectionPath, docId), equipmentData);
+                    updateNotification('success', `Equipment ${equipmentID} updated successfully.`);
+                } else {
+                    const existingEquipment = equipment.find(e => e.equipmentID === equipmentID);
+                    if (existingEquipment) {
+                        updateNotification('error', `Equipment with ID ${equipmentID} already exists.`);
+                        return;
+                    }
+                    await addDoc(collection(db, equipmentCollectionPath), { ...equipmentData, createdAt: serverTimestamp() });
+                    updateNotification('success', `Equipment ${equipmentID} added successfully.`);
+                }
+                closeModal(equipmentModal);
+            } catch (e) {
+                console.error("Error adding/updating document: ", e);
+                updateNotification('error', 'Error adding or updating equipment.');
+            }
+        }
+
+        async function deleteEquipment(docId) {
+            // Use a custom modal for confirmation
+            const confirmed = window.confirm("Are you sure you want to delete this equipment? This action cannot be undone.");
+            if (!confirmed) return;
+
+            try {
+                const equipmentCollectionPath = `artifacts/${appId}/users/${userId}/equipment`;
+                await deleteDoc(doc(db, equipmentCollectionPath, docId));
+                updateNotification('success', 'Equipment deleted successfully.');
+            } catch (e) {
+                console.error("Error deleting document: ", e);
+                updateNotification('error', 'Error deleting equipment.');
+            }
+        }
+
+        async function addServicingRecord(event) {
+            event.preventDefault();
+            const form = event.target;
+            const servicingLogCollectionPath = `artifacts/${appId}/users/${userId}/servicingLog`;
+            const equipmentCollectionPath = `artifacts/${appId}/users/${userId}/equipment`;
+            
+            const equipmentID = form['servicing-equipment-id'].value;
+            const serviceStartDate = form['service-start-date'].value;
+            const serviceEndDate = form['service-end-date'].value;
+            const servicedBy = form['serviced-by'].value;
+            const servicingPerson = form['servicing-person'].value;
+            const serviceType = form['service-type'].value;
+            const servicingCost = parseFloat(form['servicing-cost'].value) || 0;
+            const notes = form['servicing-notes'].value;
+            const reportDraft = reportTextarea.value;
+
+            try {
+                await addDoc(collection(db, servicingLogCollectionPath), {
+                    equipmentID,
+                    serviceStartDate,
+                    serviceEndDate,
+                    servicedBy,
+                    servicingPerson,
+                    serviceType,
+                    servicingCost,
+                    notes,
+                    reportDraft,
+                    createdAt: serverTimestamp()
+                });
+                
+                const item = equipment.find(e => e.equipmentID === equipmentID);
+                if (item) {
+                    let newStatus = 'Available';
+                    if (serviceEndDate) {
+                        const today = new Date().toISOString().split('T')[0];
+                        if (serviceEndDate >= today) {
+                            newStatus = 'In Servicing';
+                        }
+                    }
+
+                    const nextServiceDate = new Date(serviceStartDate);
+                    nextServiceDate.setMonth(nextServiceDate.getMonth() + 3);
+                    
+                    const updateData = {
+                        currentStatus: newStatus,
+                        lastServiceDate: serviceStartDate,
+                        nextServiceDueDate: nextServiceDate.toISOString().split('T')[0],
+                        servicingPerson: servicingPerson
+                    };
+                    await updateDoc(doc(db, equipmentCollectionPath, item.id), updateData);
+                }
+
+                updateNotification('success', `Servicing record added for equipment ${equipmentID}.`);
+                closeModal(servicingModal);
+            } catch (e) {
+                console.error("Error adding servicing record: ", e);
+                updateNotification('error', 'Error adding servicing record.');
+            }
+        }
+
+        // --- Gemini API Function ---
+        async function draftServicingReport() {
+            const form = document.getElementById('servicing-form');
+            if (!form) return;
+            const equipmentID = form['servicing-equipment-id'].value;
+            const serviceStartDate = form['service-start-date'].value;
+            const servicedBy = form['serviced-by'].value;
+            const serviceType = form['service-type'].value;
+            const notes = form['servicing-notes'].value;
+
+            if (!equipmentID || !serviceStartDate || !servicedBy || !serviceType) {
+                updateNotification('error', 'Please fill in Equipment ID, Service Start Date, Serviced By, and Service Type to generate a report draft.');
+                return;
+            }
+
+            const loadingIndicator = document.getElementById('report-loading-indicator');
+            const draftButton = document.getElementById('generate-report-btn');
+            
+            if (loadingIndicator) loadingIndicator.classList.remove('hidden');
+            if (draftButton) draftButton.disabled = true;
+            if (reportTextarea) reportTextarea.value = '';
+
+            const prompt = `Draft a professional servicing report. The equipment ID is ${equipmentID}. The service started on ${serviceStartDate}. The service type was ${serviceType}. The work was performed by ${servicedBy}. Additional notes: "${notes}". Format the report professionally with a clear subject, a salutation, and a summary of the work performed.`;
+
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            const apiKey = "" 
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+
+                if (result.candidates && result.candidates.length > 0 &&
+                    result.candidates[0].content && result.candidates[0].content.parts &&
+                    result.candidates[0].content.parts.length > 0) {
+                    const text = result.candidates[0].content.parts[0].text;
+                    if (reportTextarea) {
+                      reportTextarea.value = text;
+                      reportTextarea.classList.remove('hidden');
+                    }
+                    updateNotification('success', 'Report draft generated successfully!');
+                } else {
+                    updateNotification('error', 'Failed to generate report. Please try again.');
+                }
+            } catch (error) {
+                console.error("Gemini API Error:", error);
+                updateNotification('error', `Failed to generate report: ${error.message}`);
+            } finally {
+                if (loadingIndicator) loadingIndicator.classList.add('hidden');
+                if (draftButton) draftButton.disabled = false;
+            }
+        }
+
+        // --- Event Listeners ---
+        window.onload = function() {
+            initializeTheme();
+            initializeAppAndAuth();
+
+            // Initial state: disable navigation buttons until authentication is complete
+            const navButtons = [dashboardBtn, inventoryBtn, servicingBtn];
+            navButtons.forEach(btn => {
+                if (btn) {
+                    btn.setAttribute('disabled', true);
+                    btn.classList.add('disabled-btn');
+                }
+            });
+
+            document.getElementById('dashboard-btn')?.addEventListener('click', () => showView('dashboard'));
+            document.getElementById('inventory-btn')?.addEventListener('click', () => showView('inventory'));
+            document.getElementById('servicing-btn')?.addEventListener('click', () => showView('servicing'));
+            
+            document.getElementById('add-equipment-btn')?.addEventListener('click', () => openEquipmentModal());
+            document.getElementById('add-servicing-btn')?.addEventListener('click', () => openServicingModal());
+            
+            document.getElementById('equipment-modal-close')?.addEventListener('click', () => closeModal(equipmentModal));
+            document.getElementById('servicing-modal-close')?.addEventListener('click', () => closeModal(servicingModal));
+
+            document.getElementById('equipment-form')?.addEventListener('submit', addOrUpdateEquipment);
+            document.getElementById('servicing-form')?.addEventListener('submit', addServicingRecord);
+
+            // New event listener for the Gemini API call
+            document.getElementById('generate-report-btn')?.addEventListener('click', draftServicingReport);
+            
+            // Theme toggle listener
+            themeToggleBtn?.addEventListener('click', toggleTheme);
+
+        };
+    </script>
+</head>
+<body class="bg-[#121212] text-gray-200 font-sans p-4 transition-colors duration-300">
+
+    <!-- Notification Box -->
+    <div id="notification-box" class="hidden fixed top-4 right-4 p-4 rounded-md shadow-lg text-sm z-50"></div>
+    
+    <!-- Loading Indicator for initial app load -->
+    <div id="app-loading-indicator" class="fixed inset-0 bg-gray-900 bg-opacity-90 flex flex-col items-center justify-center text-white z-50 hidden">
+        <svg class="animate-spin h-10 w-10 text-blue-500 mb-4" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+        <p class="text-xl font-semibold">Signing in...</p>
+    </div>
+
+    <!-- Main Application Container -->
+    <div id="main-content" class="container mx-auto bg-[#000000] rounded-xl shadow-lg p-6 transition-colors duration-300">
+        <div class="flex justify-between items-center mb-6">
+            <h1 class="text-3xl font-bold text-gray-100">Equipment Management System</h1>
+            <button id="theme-toggle" class="p-2 rounded-full bg-gray-700 text-xl shadow-md transition-colors duration-300">🌙</button>
+        </div>
+        
+        <!-- User ID display -->
+        <div id="user-id-display" class="text-xs text-center text-gray-400 mb-4">
+            <span class="font-semibold">Your User ID:</span> <span id="user-id-value">Loading...</span>
+        </div>
+
+        <!-- Navigation -->
+        <nav class="flex justify-center space-x-4 mb-8">
+            <!-- Buttons are initially disabled and will be enabled on successful authentication -->
+            <button id="dashboard-btn" class="px-6 py-2 rounded-full font-medium text-sm transition-colors duration-200 disabled-btn">Dashboard</button>
+            <button id="inventory-btn" class="px-6 py-2 rounded-full font-medium text-sm transition-colors duration-200 disabled-btn">Inventory</button>
+            <button id="servicing-btn" class="px-6 py-2 rounded-full font-medium text-sm transition-colors duration-200 disabled-btn">Servicing Log</button>
+        </nav>
+
+        <!-- --- Dashboard View --- -->
+        <div id="dashboard-view" class="hidden">
+            <div id="dashboard-loading" class="text-center text-gray-500 mb-4 hidden">
+                <svg class="animate-spin h-5 w-5 mr-3 inline text-gray-400" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Loading dashboard data...
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                <div class="bg-blue-600 text-white rounded-lg p-6 shadow-md">
+                    <h3 class="text-sm font-semibold mb-2">Total Cameras</h3>
+                    <p id="total-cameras" class="text-3xl font-bold">0</p>
+                </div>
+                <div class="bg-yellow-500 text-white rounded-lg p-6 shadow-md">
+                    <h3 class="text-sm font-semibold mb-2">Cameras In Servicing</h3>
+                    <p id="cameras-in-servicing" class="text-3xl font-bold">0</p>
+                </div>
+                <div class="bg-green-500 text-white rounded-lg p-6 shadow-md">
+                    <h3 class="text-sm font-semibold mb-2">Available Cameras</h3>
+                    <p id="available-cameras" class="text-3xl font-bold">0</p>
+                </div>
+                <div class="bg-purple-600 text-white rounded-lg p-6 shadow-md">
+                    <h3 class="text-sm font-semibold mb-2">Total Servicing Cost (YTD)</h3>
+                    <p id="total-servicing-cost-ytd" class="text-3xl font-bold">BHD 0.000</p>
+                </div>
+            </div>
+
+            <div class="bg-[#121212] rounded-lg p-6 mb-8 shadow-md transition-colors duration-300">
+                <h3 class="text-lg font-semibold mb-4 text-gray-100">Current Camera Servicing</h3>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-700">
+                        <thead class="bg-gray-800">
+                            <tr>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Equipment ID</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Model</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Servicing Person</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Start Date</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cameras-in-servicing-table-body" class="bg-[#000000] divide-y divide-gray-700">
+                            <!-- Rows will be populated by JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="bg-[#121212] rounded-lg p-6 shadow-md transition-colors duration-300">
+                <h3 class="text-lg font-semibold mb-4 text-gray-100">Upcoming Camera Servicing</h3>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-700">
+                        <thead class="bg-gray-800">
+                            <tr>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Equipment ID</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Model</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Last Service</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Next Due Date</th>
+                            </tr>
+                        </thead>
+                        <tbody id="upcoming-servicing-table-body" class="bg-[#000000] divide-y divide-gray-700">
+                            <!-- Rows will be populated by JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- --- Inventory View --- -->
+        <div id="inventory-view" class="hidden">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-2xl font-bold text-gray-100">Equipment Inventory</h2>
+                <button id="add-equipment-btn" class="bg-blue-600 text-white px-4 py-2 rounded-md shadow-md hover:bg-blue-700 transition-colors duration-200">Add New Equipment</button>
+            </div>
+            <div class="overflow-x-auto bg-[#000000] rounded-lg shadow-md p-4 transition-colors duration-300">
+                <table class="min-w-full divide-y divide-gray-700">
+                    <thead class="bg-gray-800">
+                        <tr>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Equipment ID</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Equipment Type</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Serial Number</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Status</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Next Service Due</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="inventory-table-body" class="bg-[#000000] divide-y divide-gray-700">
+                        <!-- Rows populated by JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- --- Servicing Log View --- -->
+        <div id="servicing-view" class="hidden">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-2xl font-bold text-gray-100">Servicing Log</h2>
+                <button id="add-servicing-btn" class="bg-blue-600 text-white px-4 py-2 rounded-md shadow-md hover:bg-blue-700 transition-colors duration-200">Add Servicing Record</button>
+            </div>
+            <div class="overflow-x-auto bg-[#000000] rounded-lg shadow-md p-4 transition-colors duration-300">
+                <table class="min-w-full divide-y divide-gray-700">
+                    <thead class="bg-gray-800">
+                        <tr>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Equipment ID</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Service Start</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Service End</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Servicing Person</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Service Type</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Cost (BHD)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="servicing-table-body" class="bg-[#000000] divide-y divide-gray-700">
+                        <!-- Rows populated by JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Equipment Add/Edit Modal -->
+    <div id="equipment-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50 flex items-center justify-center">
+        <div class="relative p-8 bg-[#000000] w-96 rounded-lg shadow-xl transition-colors duration-300">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-xl font-semibold">Equipment Details</h3>
+                <button id="equipment-modal-close" class="text-gray-400 hover:text-gray-200 text-2xl">&times;</button>
+            </div>
+            <form id="equipment-form" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-300">Equipment ID</label>
+                    <input type="text" id="equipment-id" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-300">Equipment Type</label>
+                    <select id="equipment-type" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"></select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-300">Equipment Model</label>
+                    <input type="text" id="equipment-model" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-300">Serial Number</label>
+                    <input type="text" id="equipment-serial" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-300">Purchase Date</label>
+                    <input type="date" id="equipment-purchase-date" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-300">Status</label>
+                    <select id="equipment-status" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"></select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-300">Servicing Notes</label>
+                    <textarea id="equipment-notes" class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"></textarea>
+                </div>
+                <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors duration-200">Save</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Servicing Add Modal -->
+    <div id="servicing-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50 flex items-center justify-center">
+        <div class="relative p-8 bg-[#000000] w-[500px] rounded-lg shadow-xl transition-colors duration-300">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-xl font-semibold">Add Servicing Record</h3>
+                <button id="servicing-modal-close" class="text-gray-400 hover:text-gray-200 text-2xl">&times;</button>
+            </div>
+            <form id="servicing-form" class="space-y-4">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300">Equipment ID</label>
+                        <select id="servicing-equipment-id" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"></select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300">Service Start Date</label>
+                        <input type="date" id="service-start-date" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300">Service End Date (optional)</label>
+                        <input type="date" id="service-end-date" class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300">Serviced By</label>
+                        <input type="text" id="serviced-by" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300">Servicing Person (who took it)</label>
+                        <input type="text" id="servicing-person" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300">Service Type</label>
+                        <select id="service-type" required class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"></select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-300">Servicing Cost (BHD)</label>
+                        <input type="number" step="0.001" id="servicing-cost" class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-300">Notes</label>
+                    <textarea id="servicing-notes" class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2"></textarea>
+                </div>
+
+                <!-- Gemini API Integration -->
+                <div class="mt-4">
+                    <button type="button" id="generate-report-btn" class="w-full bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 transition-colors duration-200">
+                        ✨ Generate Report Draft
+                    </button>
+                    <p id="report-loading-indicator" class="text-center text-gray-500 mt-2 hidden">Generating draft...</p>
+                    <div class="mt-4">
+                        <label class="block text-sm font-medium text-gray-300">Generated Report Draft</label>
+                        <textarea id="servicing-report-draft" rows="8" class="mt-1 block w-full rounded-md border-gray-600 bg-gray-900 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2 hidden"></textarea>
+                    </div>
+                </div>
+
+                <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition-colors duration-200">Save Record</button>
+            </form>
+        </div>
+    </div>
+
+</body>
+</html>
